@@ -36,6 +36,7 @@
  * that was within the range.
  */
 
+import { createHash } from "node:crypto";
 import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -169,6 +170,8 @@ export interface ReplayProgressFile {
     to: number | null;
   };
   contracts: ContractSource[];
+  /** Normalized SHA-256 fingerprint of the replay filter set (network, range, contracts, contractIds). */
+  filterFingerprint?: string | undefined;
   targets: Partial<Record<ContractSource, ReplayProgressTarget>>;
 }
 
@@ -292,6 +295,40 @@ export function normalizeRangeTo(to?: number | null): number | null {
   return to !== undefined && to !== null ? to : null;
 }
 
+export interface ReplayFilterFingerprintInput {
+  from: string | number;
+  to?: number | null | undefined;
+  contracts: ContractSource[];
+  network: string;
+  config: Pick<StellarConfig, "marketContractId" | "squadContractId">;
+}
+
+/**
+ * Compute a deterministic, normalized SHA-256 fingerprint for the replay filter
+ * set (network, range, sorted unique contracts, and their resolved contract IDs).
+ *
+ * Used to guard `--progress-file` resumes against accidentally reusing a
+ * checkpoint created for a different filter set.
+ */
+export function computeReplayFilterFingerprint(input: ReplayFilterFingerprintInput): string {
+  const normalizedContracts = Array.from(new Set(input.contracts)).sort();
+  const contractIds: Record<string, string> = {};
+  for (const source of normalizedContracts) {
+    const id = source === "market" ? input.config.marketContractId : input.config.squadContractId;
+    contractIds[source] = id.trim();
+  }
+  const canonical = {
+    network: input.network.trim().toLowerCase(),
+    range: {
+      from: normalizeRangeFrom(input.from),
+      to: normalizeRangeTo(input.to),
+    },
+    contracts: normalizedContracts,
+    contractIds,
+  };
+  return createHash("sha256").update(JSON.stringify(canonical)).digest("hex");
+}
+
 export async function loadAndValidateProgressFile(
   filePath: string,
   opts: {
@@ -326,6 +363,44 @@ export async function loadAndValidateProgressFile(
   const p = parsed as Partial<ReplayProgressFile>;
   if (p.format !== "mimir-replay-progress-v1" || p.version !== 1) {
     throw new Error(`incompatible progress file format or version in "${filePath}" (expected mimir-replay-progress-v1 v1)`);
+  }
+
+  // Validate normalized filter fingerprint when present
+  const expectedFingerprint = computeReplayFilterFingerprint(opts);
+  if (p.filterFingerprint !== undefined) {
+    if (typeof p.filterFingerprint !== "string" || p.filterFingerprint.trim() === "") {
+      throw new Error(
+        `invalid filterFingerprint in progress file "${filePath}". ` +
+          `Remove the progress file or pass a new --progress-file path to start a fresh replay.`,
+      );
+    }
+    if (p.filterFingerprint !== expectedFingerprint) {
+      const diffs: string[] = [];
+      const expectedFrom = normalizeRangeFrom(opts.from);
+      const fileFrom = normalizeRangeFrom(p.range?.from ?? "");
+      if (expectedFrom !== fileFrom) {
+        diffs.push(`from (${fileFrom || "unset"} vs ${expectedFrom})`);
+      }
+      const expectedTo = normalizeRangeTo(opts.to);
+      const fileTo = normalizeRangeTo(p.range?.to);
+      if (expectedTo !== fileTo) {
+        diffs.push(`to (${fileTo ?? "tip"} vs ${expectedTo ?? "tip"})`);
+      }
+      if ((p.network ?? "").trim().toLowerCase() !== opts.network.trim().toLowerCase()) {
+        diffs.push(`network (${p.network ?? "unset"} vs ${opts.network})`);
+      }
+      const fileContracts = Array.from(new Set(p.contracts ?? [])).sort().join(",");
+      const expectedContracts = Array.from(new Set(opts.contracts)).sort().join(",");
+      if (fileContracts !== expectedContracts) {
+        diffs.push(`contracts (${fileContracts || "none"} vs ${expectedContracts || "none"})`);
+      }
+      const diffSummary = diffs.length > 0 ? ` (${diffs.join("; ")})` : "";
+      throw new Error(
+        `progress file "${filePath}" was created for a different filter set${diffSummary} ` +
+          `[fingerprint ${p.filterFingerprint.slice(0, 12)} != ${expectedFingerprint.slice(0, 12)}]. ` +
+          `Re-run with the original --from/--to/--contract/network settings, or use a new --progress-file path.`,
+      );
+    }
   }
 
   // Validate range
@@ -921,6 +996,13 @@ export async function runReplayCli(opts: {
 
   let progressData: ReplayProgressFile | null = null;
   if (progressFile) {
+    const filterFingerprint = computeReplayFilterFingerprint({
+      from: fromRaw,
+      to: toLedger,
+      contracts: requestedContracts,
+      network,
+      config,
+    });
     try {
       progressData = await loadAndValidateProgressFile(progressFile, {
         from: fromRaw,
@@ -930,6 +1012,9 @@ export async function runReplayCli(opts: {
         config,
       });
       if (progressData) {
+        if (!progressData.filterFingerprint) {
+          progressData.filterFingerprint = filterFingerprint;
+        }
         progress(`[replay] loaded progress file "${progressFile}"`);
       } else {
         progressData = {
@@ -944,6 +1029,7 @@ export async function runReplayCli(opts: {
             to: normalizeRangeTo(toLedger),
           },
           contracts: requestedContracts,
+          filterFingerprint,
           targets: {},
         };
       }
